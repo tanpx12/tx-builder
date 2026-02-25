@@ -1,0 +1,30 @@
+{
+  "name": "tx-builder",
+  "version": "1.0.0",
+  "description": "I have a NEAR contract deployed on NEAR testnet at `testnet-deployer.testnet` . This contract ultilize chain signature to perform actions crosschain.",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "start:sign": "tsx src/index.ts --sign",
+    "derive": "tsx src/index.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.3.0",
+    "@types/elliptic": "^6.4.18",
+    "@types/node": "^25.3.0",
+    "bitcoinjs-lib": "^7.0.1",
+    "bs58check": "^4.0.0",
+    "dotenv": "^17.3.1",
+    "elliptic": "^6.6.1",
+    "ethers": "^6.16.0",
+    "js-sha256": "^0.11.1",
+    "near-api-js": "^5.1.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
