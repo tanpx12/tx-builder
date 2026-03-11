@@ -8,7 +8,15 @@
     "build": "tsc",
     "start": "tsx src/index.ts",
     "start:sign": "tsx src/index.ts --sign",
-    "derive": "tsx src/index.ts"
+    "derive": "tsx src/index.ts",
+    "demo:eth-transfer": "tsx src/demo-eth-transfer.ts",
+    "policy": "tsx src/manage-policy.ts",
+    "demo:stellar-payment": "tsx src/demo-stellar-payment.ts",
+    "mainnet:derive": "tsx src/derive-mainnet.ts",
+    "mainnet:check": "tsx src/mainnet/check-status.ts",
+    "mainnet:policies": "tsx src/mainnet/set-policies.ts",
+    "mainnet:policies:dry": "tsx src/mainnet/set-policies.ts --dry-run",
+    "mainnet:execute": "tsx src/mainnet/execute-batch.ts"
   },
   "keywords": [],
   "author": "",
