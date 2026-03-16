@@ -12,11 +12,10 @@
 // ──────────────────────────────────────────────
 
 import "dotenv/config";
-import { deriveAllAddresses } from "./derive.js";
-import { buildEthTestTx, signEthTx } from "./eth.js";
-import { buildBtcTestTx, signBtcTx } from "./btc.js";
-import { buildStellarTestTx, signStellarTx } from "./stellar.js";
-import { initContract } from "./near.js";
+import { deriveUniversalAccountAddresses } from "../core/derive.js";
+import { buildEthTestTx, signEthTx } from "../core/eth.js";
+import { buildStellarTestTx, signStellarTx } from "../core/stellar.js";
+import { initContract } from "../core/near.js";
 
 async function main() {
   const args = process.argv.slice(2);
@@ -52,16 +51,13 @@ async function main() {
 
   // ── Step 1: Derive addresses ────────────────
   console.log("🔑 Deriving cross-chain addresses...\n");
-  const addresses = await deriveAllAddresses();
+  const addresses = await deriveUniversalAccountAddresses();
 
   console.log("\n┌─────────────────────────────────────────────────┐");
   console.log("│              DERIVED ADDRESSES                   │");
   console.log("├─────────────────────────────────────────────────┤");
-  console.log("│ Ethereum (Sepolia):");
-  console.log("│  ", addresses.ethereum.address);
-  console.log("│");
-  console.log("│ Bitcoin (Testnet):");
-  console.log("│  ", addresses.bitcoin.address);
+  console.log("│ EVM (Sepolia):");
+  console.log("│  ", addresses.evm.address);
   console.log("│");
   console.log("│ Stellar (Testnet):");
   console.log("│  ", addresses.stellar.address);
@@ -71,10 +67,7 @@ async function main() {
   console.log("\n\n📝 Building test transactions...\n");
 
   // Ethereum
-  buildEthTestTx(addresses.ethereum.address);
-
-  // Bitcoin
-  buildBtcTestTx(addresses.bitcoin.address, addresses.bitcoin.publicKeyHex);
+  buildEthTestTx(addresses.evm.address);
 
   // Stellar
   buildStellarTestTx(addresses.stellar.address);
@@ -91,27 +84,16 @@ async function main() {
 
     try {
       console.log("── Signing Ethereum TX ──");
-      await signEthTx(addresses.ethereum.address, nearPrivateKey);
+      await signEthTx(addresses.evm.address, nearPrivateKey);
     } catch (e: any) {
       console.error("  ETH signing failed:", e.message);
-    }
-
-    try {
-      console.log("\n── Signing Bitcoin TX ──");
-      await signBtcTx(
-        addresses.bitcoin.address,
-        addresses.bitcoin.publicKeyHex,
-        nearPrivateKey
-      );
-    } catch (e: any) {
-      console.error("  BTC signing failed:", e.message);
     }
 
     try {
       console.log("\n── Signing Stellar TX ──");
       await signStellarTx(
         addresses.stellar.address,
-        addresses.stellar.publicKeyHex,
+        addresses.stellar.secp256k1PublicKeyHex,
         nearPrivateKey
       );
     } catch (e: any) {

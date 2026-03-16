@@ -23,7 +23,7 @@ export const USDC_ADDRESS = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 
 // ── Morpho Blue (Arbitrum) ──
 export const MORPHO_ADDRESS = "0x6c247b1F6182318877311737BaC0844bAa518F5e";
-export const MORPHO_MARKET_ID = "0xb323495f7e4148be5643a4ea4a8221eef163e4bccfdedc2a6f4696baacbc86cc";
+export const MORPHO_MARKET_ID = "0xca83d02be579485cc10945c9597a6141e772f1cf0e0aa28d09a327b6cbd8642c";
 
 // ── Stellar Mainnet ──
 export const STELLAR_MAINNET_HORIZON = "https://horizon.stellar.org";
@@ -51,6 +51,10 @@ export const MAINNET_DERIVATION_PATHS = {
   ethereum: buildMainnetDerivationPath("ethereum", 0),
   stellar: buildMainnetDerivationPath("stellar", 0),
 };
+
+// ── Reverse Bridge: Stellar USDC → Arbitrum USDC ──
+export const ONECLICK_REVERSE_ORIGIN_ASSET = ONECLICK_DEST_ASSET; // Stellar USDC
+export const ONECLICK_REVERSE_DEST_ASSET = ONECLICK_ORIGIN_ASSET; // Arbitrum USDC
 
 // ── Aquarius AMM API ──
 export const AQUARIUS_API_URL = "https://amm-api.aqua.network/pools/find-path/";

@@ -3,7 +3,7 @@
 // ──────────────────────────────────────────────
 
 /** NEAR testnet RPC endpoint */
-export const NEAR_RPC = "https://rpc.testnet.near.org";
+export const NEAR_RPC = "https://test.rpc.fastnear.com";
 
 /** The NEAR account that deployed the asset-manager contract */
 export const NEAR_ACCOUNT_ID = "testnet-deployer.testnet";
@@ -42,7 +42,7 @@ export const DOMAIN_IDS = {
 };
 
 /** Ethereum Sepolia testnet */
-export const ETH_RPC = "https://rpc.sepolia.org";
+export const ETH_RPC = "https://sepolia.drpc.org";
 export const ETH_CHAIN_ID = 11155111; // Sepolia
 
 /** Bitcoin testnet3 */

@@ -11,8 +11,8 @@ import {
   SIGN_DEPOSIT,
   POLICY_GAS,
   MAINNET_DERIVATION_PATHS,
-} from "./config-mainnet.js";
-import { publicKeyToEvmAddress, publicKeyToStellarAddress } from "./derive.js";
+} from "./config.js";
+import { publicKeyToEvmAddress, publicKeyToStellarAddress } from "../core/derive.js";
 
 // ── Base58 decode (no checksum) ──
 
@@ -165,19 +165,35 @@ export async function submitBatch(
   payloads: any[],
   derivationIndex: number = 0,
 ): Promise<{ nearTxId: string; expectedBatchId: number }> {
-  // Snapshot the batch count before submission to derive the batch_id
-  const totalBefore: number = await account.viewFunction({
-    contractId: MAINNET_CONTRACT_ID,
-    methodName: "get_total_batches",
-    args: {},
-  });
-  const expectedBatchId = totalBefore + 1;
+  // Probe for next_batch_id by scanning get_batch_status until we find a gap
+  let expectedBatchId = 1;
+  for (let probe = 1; probe < 10000; probe++) {
+    const status = await account.viewFunction({
+      contractId: MAINNET_CONTRACT_ID,
+      methodName: "get_batch_status",
+      args: { batch_id: probe },
+    });
+    if (status === null || status === undefined) {
+      expectedBatchId = probe;
+      break;
+    }
+    expectedBatchId = probe + 1;
+  }
 
   const totalDeposit = BigInt(payloads.length) * SIGN_DEPOSIT;
 
+  // Custom JSON serialization to handle BigInt i64 fields (sequence_number, limit)
+  // that exceed Number.MAX_SAFE_INTEGER. JSON.stringify would lose precision or
+  // produce strings; the contract expects bare i64 numbers in JSON.
+  const argsJson = JSON.stringify(
+    { payloads, derivation_index: derivationIndex, use_balance: false },
+    (_key, value) => (typeof value === "bigint" ? `__BIGINT__${value}__` : value),
+  ).replace(/"__BIGINT__(-?\d+)__"/g, "$1");
+  const argsBytes = Buffer.from(argsJson);
+
   const action = transactions.functionCall(
     "request_batch_signature",
-    { payloads, derivation_index: derivationIndex, use_balance: false },
+    argsBytes,
     SIGN_GAS,
     totalDeposit,
   );
@@ -191,20 +207,21 @@ export async function submitBatch(
 
 /**
  * Crank the next pending item in a batch via sign_batch_next().
+ * Uses synchronous functionCall so NEAR nonce is properly sequenced.
+ * The MPC signing happens asynchronously via callback — this returns
+ * once the crank tx is confirmed, not when MPC signing completes.
  */
 export async function crankBatchNext(
   account: Awaited<ReturnType<typeof getMainnetAccount>>,
   batchId: number,
 ): Promise<void> {
-  const action = transactions.functionCall(
-    "sign_batch_next",
-    { batch_id: batchId },
-    SIGN_GAS,
-    BigInt("0"),
-  );
-  const [, nearSignedTx] = await account.signTransaction(MAINNET_CONTRACT_ID, [action]);
-  const nearProvider = (account as any).connection.provider as any;
-  await nearProvider.sendTransactionAsync(nearSignedTx);
+  await account.functionCall({
+    contractId: MAINNET_CONTRACT_ID,
+    methodName: "sign_batch_next",
+    args: { batch_id: batchId },
+    gas: SIGN_GAS,
+    attachedDeposit: BigInt("0"),
+  });
 }
 
 /**
@@ -217,11 +234,17 @@ export async function pollBatchStatus(
   intervalMs = 5000,
 ): Promise<BatchStatus> {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const status: BatchStatus = await account.viewFunction({
+    const status: BatchStatus | null = await account.viewFunction({
       contractId: MAINNET_CONTRACT_ID,
       methodName: "get_batch_status",
       args: { batch_id: batchId },
     });
+
+    if (!status) {
+      console.log(`  [${attempt}/${maxAttempts}] Batch ${batchId}: not found yet...`);
+      await new Promise((r) => setTimeout(r, intervalMs));
+      continue;
+    }
 
     console.log(
       `  [${attempt}/${maxAttempts}] Batch ${batchId}: ${status.completed}/${status.total} signed, ${status.failed} failed, ${status.pending} pending`,

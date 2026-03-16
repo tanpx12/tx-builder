@@ -16,18 +16,18 @@ import {
   MORPHO_ADDRESS,
   STELLAR_MAINNET_HORIZON,
   MAINNET_CONTRACT_ID,
-} from "../config-mainnet.js";
+} from "./config.js";
 import {
   getMainnetAccount,
   deriveMainnetAddresses,
   getPolicy,
-} from "../near-mainnet.js";
+} from "./near.js";
 import {
   APPROVE_SELECTOR,
   SUPPLY_COLLATERAL_SELECTOR,
   BORROW_SELECTOR,
   TRANSFER_SELECTOR,
-} from "../morpho.js";
+} from "./morpho.js";
 
 // ── Helpers ──
 

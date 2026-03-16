@@ -1,7 +1,7 @@
 // Derive EVM and Stellar addresses using NEAR mainnet MPC signer
 import { connect, keyStores } from "near-api-js";
 import type { ConnectConfig } from "near-api-js";
-import { publicKeyToEvmAddress, publicKeyToStellarAddress } from "./derive.js";
+import { publicKeyToEvmAddress, publicKeyToStellarAddress } from "../core/derive.js";
 
 const MAINNET_CONTRACT_ID = "8fa7217570eb2766d2328a819098acf5e7a116c2d4d5c4d7823fccd83ec0556e";
 const MAINNET_MPC_CONTRACT_ID = "v1.signer";
