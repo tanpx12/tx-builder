@@ -23,48 +23,48 @@ async function main() {
   const signMode = args.includes("--sign");
   const nearPrivateKey = process.env.KEY;
 
-  console.log("╔═══════════════════════════════════════════════╗");
-  console.log("║   NEAR Chain Signature - TX Builder           ║");
-  console.log("╚═══════════════════════════════════════════════╝");
+  console.log("+==============================================+");
+  console.log("|   NEAR Chain Signature - TX Builder           |");
+  console.log("+==============================================+");
   console.log();
 
   // ── Step 0: Initialize contract (if --init flag) ──
   if (initMode) {
     if (!nearPrivateKey) {
-      console.error("❌ KEY not found in .env. Add your NEAR private key:");
+      console.error("ERROR: KEY not found in .env. Add your NEAR private key:");
       console.error('   KEY="ed25519:<YOUR_KEY>"');
       process.exit(1);
     }
-    console.log("🛠️  Initializing contract at", "testnet-deployer.testnet...");
+    console.log("Initializing contract at testnet-deployer.testnet...");
     try {
       await initContract(nearPrivateKey);
-      console.log("✅ Contract initialized successfully!\n");
+      console.log("Contract initialized successfully!\n");
     } catch (e: any) {
       if (e.message?.includes("already been initialized") || e.message?.includes("Cannot deserialize")) {
-        console.log("ℹ️  Contract is already initialized.\n");
+        console.log("Contract is already initialized.\n");
       } else {
-        console.error("❌ Initialization failed:", e.message);
+        console.error("Initialization failed:", e.message);
         process.exit(1);
       }
     }
   }
 
   // ── Step 1: Derive addresses ────────────────
-  console.log("🔑 Deriving cross-chain addresses...\n");
+  console.log("Deriving cross-chain addresses...\n");
   const addresses = await deriveUniversalAccountAddresses();
 
-  console.log("\n┌─────────────────────────────────────────────────┐");
-  console.log("│              DERIVED ADDRESSES                   │");
-  console.log("├─────────────────────────────────────────────────┤");
-  console.log("│ EVM (Sepolia):");
-  console.log("│  ", addresses.evm.address);
-  console.log("│");
-  console.log("│ Stellar (Testnet):");
-  console.log("│  ", addresses.stellar.address);
-  console.log("└─────────────────────────────────────────────────┘");
+  console.log("\n+-------------------------------------------------+");
+  console.log("|              DERIVED ADDRESSES                   |");
+  console.log("+-------------------------------------------------+");
+  console.log("| EVM (Sepolia):");
+  console.log("|  ", addresses.evm.address);
+  console.log("|");
+  console.log("| Stellar (Testnet):");
+  console.log("|  ", addresses.stellar.address);
+  console.log("+-------------------------------------------------+");
 
   // ── Step 2: Build test transactions ─────────
-  console.log("\n\n📝 Building test transactions...\n");
+  console.log("\n\nBuilding test transactions...\n");
 
   // Ethereum
   buildEthTestTx(addresses.evm.address);
@@ -75,11 +75,11 @@ async function main() {
   // ── Step 3: Sign (if --sign flag provided) ──
   if (signMode) {
     if (!nearPrivateKey) {
-      console.error("\n❌ KEY not found in .env. Add your NEAR private key:");
+      console.error("\nERROR: KEY not found in .env. Add your NEAR private key:");
       console.error('   KEY="ed25519:<YOUR_KEY>"');
       process.exit(1);
     }
-    console.log("\n\n✍️  Signing transactions via MPC...");
+    console.log("\n\nSigning transactions via MPC...");
     console.log("  Using KEY from .env\n");
 
     try {
@@ -93,18 +93,18 @@ async function main() {
       console.log("\n── Signing Stellar TX ──");
       await signStellarTx(
         addresses.stellar.address,
-        addresses.stellar.secp256k1PublicKeyHex,
+        addresses.stellar.ed25519PublicKeyHex,
         nearPrivateKey
       );
     } catch (e: any) {
       console.error("  XLM signing failed:", e.message);
     }
   } else {
-    console.log("\n\nℹ️  To request MPC signatures, run with:");
+    console.log("\n\nTo request MPC signatures, run with:");
     console.log("    npx tsx src/index.ts --sign");
   }
 
-  console.log("\n✅ Done!");
+  console.log("\nDone!");
 }
 
 main().catch((err) => {

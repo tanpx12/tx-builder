@@ -1,8 +1,9 @@
 // src/near-mainnet.ts
-// NEAR mainnet helpers — account connection, batch signing, polling
+// NEAR mainnet helpers — account connection, batch signing, polling, MPC Ed25519 signing
 
 import { connect, keyStores, KeyPair, transactions, utils } from "near-api-js";
 import type { ConnectConfig } from "near-api-js";
+import type { Transaction } from "@stellar/stellar-sdk";
 import {
   MAINNET_CONTRACT_ID,
   MAINNET_MPC_CONTRACT_ID,
@@ -12,7 +13,8 @@ import {
   POLICY_GAS,
   MAINNET_DERIVATION_PATHS,
 } from "./config.js";
-import { publicKeyToEvmAddress, publicKeyToStellarAddress } from "../core/derive.js";
+import { publicKeyToEvmAddress, ed25519PublicKeyToStellarAddress, parseMpcPublicKey } from "../core/derive.js";
+import { attachMpcEd25519Signature, type MpcEd25519Signature } from "../core/stellar.js";
 
 // ── Base58 decode (no checksum) ──
 
@@ -34,12 +36,12 @@ function bs58Decode(str: string): Uint8Array {
   return Uint8Array.from([...new Uint8Array(leadingZeros), ...bytes]);
 }
 
-function parseMpcPublicKey(raw: string): string {
+function parseLocalMpcPublicKey(raw: string): string {
   const parts = raw.split(":");
   const keyPart = parts[parts.length - 1];
   if (!keyPart) throw new Error("Invalid MPC public key format");
   const keyBytes = bs58Decode(keyPart);
-  if (keyBytes.length === 64) {
+  if (keyBytes.length === 64 && raw.startsWith("secp256k1:")) {
     return "04" + Buffer.from(keyBytes).toString("hex");
   }
   return Buffer.from(keyBytes).toString("hex");
@@ -65,37 +67,101 @@ export async function getMainnetAccount(privateKey?: string) {
 
 export interface MainnetDerivedAddresses {
   evm: { address: string; publicKeyHex: string };
-  stellar: { address: string; ed25519PublicKeyHex: string; secp256k1PublicKeyHex: string };
+  stellar: { address: string; ed25519PublicKeyHex: string };
 }
 
 export async function deriveMainnetAddresses(): Promise<MainnetDerivedAddresses> {
   const account = await getMainnetAccount();
 
+  // EVM: key_version 0 (secp256k1)
   const evmDerivedRaw: string = await account.viewFunction({
     contractId: MAINNET_MPC_CONTRACT_ID,
     methodName: "derived_public_key",
     args: { path: MAINNET_DERIVATION_PATHS.ethereum, predecessor: MAINNET_CONTRACT_ID },
   });
-  const evmChildHex = parseMpcPublicKey(evmDerivedRaw);
+  const evmChildHex = parseLocalMpcPublicKey(evmDerivedRaw);
 
+  // Stellar: key_version 1 (Ed25519) — MPC natively derives Ed25519 public key
   const stellarDerivedRaw: string = await account.viewFunction({
     contractId: MAINNET_MPC_CONTRACT_ID,
     methodName: "derived_public_key",
-    args: { path: MAINNET_DERIVATION_PATHS.stellar, predecessor: MAINNET_CONTRACT_ID },
+    args: {
+      path: MAINNET_DERIVATION_PATHS.stellar,
+      predecessor: MAINNET_CONTRACT_ID,
+      key_version: 1,
+    },
   });
-  const stellarChildHex = parseMpcPublicKey(stellarDerivedRaw);
+  const stellarEd25519Hex = parseMpcPublicKey(stellarDerivedRaw);
 
   const evmAddress = publicKeyToEvmAddress(evmChildHex);
-  const stellar = publicKeyToStellarAddress(stellarChildHex);
+  const stellar = ed25519PublicKeyToStellarAddress(stellarEd25519Hex);
 
   return {
     evm: { address: evmAddress, publicKeyHex: evmChildHex },
     stellar: {
       address: stellar.address,
       ed25519PublicKeyHex: stellar.ed25519PublicKeyHex,
-      secp256k1PublicKeyHex: stellarChildHex,
     },
   };
+}
+
+// ── MPC Ed25519 Signing (Mainnet) ──
+
+/**
+ * Request an Ed25519 signature from the MPC signer on mainnet.
+ *
+ * Calls v1.signer directly with key_version: 1 for Ed25519.
+ * The payload must be a 32-byte hash (e.g., Stellar transaction hash).
+ *
+ * Returns the MPC signature in { big_r, s, recovery_id } format.
+ */
+export async function requestMainnetMpcSignature(
+  account: Awaited<ReturnType<typeof getMainnetAccount>>,
+  payload: number[],
+  derivationIndex: number = 0,
+): Promise<MpcSignature> {
+  const path = MAINNET_DERIVATION_PATHS.stellar;
+
+  const result = await account.functionCall({
+    contractId: MAINNET_MPC_CONTRACT_ID,
+    methodName: "sign",
+    args: {
+      request: {
+        payload,
+        path: `${path}`,
+        key_version: 1, // Ed25519
+      },
+    },
+    gas: SIGN_GAS,
+    attachedDeposit: SIGN_DEPOSIT,
+  });
+
+  const successValue = (result.status as any).SuccessValue;
+  if (!successValue) {
+    throw new Error("MPC signature request failed: " + JSON.stringify(result.status));
+  }
+  return JSON.parse(Buffer.from(successValue, "base64").toString());
+}
+
+/**
+ * Sign a Stellar transaction via MPC Ed25519 on mainnet.
+ *
+ * Hashes the transaction, requests an Ed25519 signature from the MPC signer,
+ * and attaches the signature to the transaction envelope.
+ *
+ * This replaces the insecure local keypair signing pattern.
+ */
+export async function signStellarTransactionViaMpc(
+  account: Awaited<ReturnType<typeof getMainnetAccount>>,
+  tx: Transaction,
+  ed25519PublicKeyHex: string,
+  derivationIndex: number = 0,
+): Promise<void> {
+  const txHash = tx.hash();
+  const payload = Array.from(txHash);
+
+  const sig = await requestMainnetMpcSignature(account, payload, derivationIndex);
+  attachMpcEd25519Signature(tx, ed25519PublicKeyHex, sig as MpcEd25519Signature);
 }
 
 // ── Policy Helpers ──

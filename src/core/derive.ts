@@ -2,20 +2,17 @@
 // Address derivation from MPC root public key + derivation path
 // Uses NEAR Chain Signatures key derivation (KDF)
 //
-// Both EVM and Stellar use key_version: 0 (secp256k1) in the asset-manager
-// contract's request_signature() — this is hard-coded in signing.rs.
-// The NEAR chain-sig KDF produces a child secp256k1 key for both chains.
-//
-// Stellar address: SHA-256 of the compressed secp256k1 child key → 32-byte
-// Ed25519 seed → Stellar keypair. This gives a deterministic, reproducible
-// Stellar G... address tied to the derivation path.
+// EVM uses key_version: 0 (secp256k1) — the MPC derives a child secp256k1 key.
+// Stellar uses key_version: 1 (Ed25519) — the MPC derives a child Ed25519 key
+// natively, so the Stellar address is derived directly from the MPC Ed25519
+// public key without any local seed workaround.
 // ──────────────────────────────────────────────
 
 import elliptic from "elliptic";
 const { ec: EC } = elliptic;
 import { sha256 } from "js-sha256";
 import { ethers } from "ethers";
-import { Keypair as StellarKeypair } from "@stellar/stellar-sdk";
+import { Keypair as StellarKeypair, StrKey } from "@stellar/stellar-sdk";
 import { NEAR_ACCOUNT_ID, MPC_CONTRACT_ID, DERIVATION_PATHS } from "./config.js";
 import { fetchMpcPublicKey, getNearAccount } from "./near.js";
 
@@ -24,16 +21,17 @@ const secp256k1 = new EC("secp256k1");
 // ── helpers ──────────────────────────────────
 
 /**
- * Parse the MPC contract public key string ("secp256k1:BASE58...")
- * into an uncompressed hex public key (04 + x + y, 130 hex chars).
+ * Parse the MPC contract public key string ("secp256k1:BASE58..." or "ed25519:BASE58...")
+ * into a hex string. For secp256k1, returns uncompressed (04 + x + y, 130 hex chars).
+ * For Ed25519, returns the raw 32-byte public key as hex (64 hex chars).
  */
-function parseMpcPublicKey(raw: string): string {
+export function parseMpcPublicKey(raw: string): string {
   const parts = raw.split(":");
   const keyPart = parts[parts.length - 1];
   if (!keyPart) throw new Error("Invalid MPC public key format");
   const keyBytes = bs58Decode(keyPart);
-  // keyBytes is 64 bytes (x || y) — prepend 04 for uncompressed form
-  if (keyBytes.length === 64) {
+  // secp256k1: 64 bytes (x || y) — prepend 04 for uncompressed form
+  if (keyBytes.length === 64 && raw.startsWith("secp256k1:")) {
     return "04" + Buffer.from(keyBytes).toString("hex");
   }
   return Buffer.from(keyBytes).toString("hex");
@@ -109,17 +107,34 @@ function compressPublicKey(uncompressedHex: string): Buffer {
 }
 
 /**
- * Stellar address from an uncompressed secp256k1 public key.
+ * Stellar address from a raw 32-byte Ed25519 public key (hex).
  *
- * NOTE: v1.signer-prod.testnet only supports secp256k1 (key_version: 0). There is no
- * Ed25519 MPC signing available. This function derives a deterministic Stellar Ed25519
- * address from the secp256k1 child key via SHA-256 of the compressed key as the Ed25519
- * seed. The MPC cannot sign transactions from this Stellar account — this address is
- * display-only until the MPC adds Ed25519 support.
+ * The MPC signer natively supports Ed25519 (key_version/domain_id: 1).
+ * The `derived_public_key` view function returns an Ed25519 public key
+ * when called with key_version: 1, and the MPC signs with that key directly.
  *
- * Returns the standard Stellar StrKey public key (G...).
- * Also returns the raw 32-byte Ed25519 public key as hex — needed as the
- * source_account field in build_stellar_payment_payload / build_stellar_invoke_contract_payload.
+ * Returns the standard Stellar StrKey public key (G...) and the raw
+ * 32-byte Ed25519 public key as hex (needed as source_account in XDR builders).
+ */
+export function ed25519PublicKeyToStellarAddress(ed25519PublicKeyHex: string): {
+  address: string;
+  ed25519PublicKeyHex: string;
+} {
+  const pubKeyBytes = Buffer.from(ed25519PublicKeyHex, "hex");
+  if (pubKeyBytes.length !== 32) {
+    throw new Error(`Expected 32-byte Ed25519 public key, got ${pubKeyBytes.length} bytes`);
+  }
+  const address = StrKey.encodeEd25519PublicKey(pubKeyBytes);
+  return {
+    address,
+    ed25519PublicKeyHex,
+  };
+}
+
+/**
+ * @deprecated Use ed25519PublicKeyToStellarAddress() with the MPC Ed25519 key instead.
+ * This legacy function derived a Stellar address from a secp256k1 key via SHA-256 hash,
+ * which was insecure because the Ed25519 "private key" was publicly derivable.
  */
 export function publicKeyToStellarAddress(uncompressedHex: string): {
   address: string;
@@ -130,7 +145,6 @@ export function publicKeyToStellarAddress(uncompressedHex: string): {
   const keypair = StellarKeypair.fromRawEd25519Seed(seed);
   return {
     address: keypair.publicKey(),
-    // Raw 32-byte Ed25519 public key (no StrKey encoding) — used as source_account in XDR
     ed25519PublicKeyHex: Buffer.from(keypair.rawPublicKey()).toString("hex"),
   };
 }
@@ -149,36 +163,36 @@ export interface DerivedAddresses {
     address: string;
     /** Raw 32-byte Ed25519 public key hex — use as source_account in XDR builders */
     ed25519PublicKeyHex: string;
-    /** Underlying secp256k1 child key the Ed25519 seed was derived from */
-    secp256k1PublicKeyHex: string;
     derivationPath: string;
   };
   mpcRootPublicKey: string;
 }
 
 /**
- * Fetch the authoritative child secp256k1 public key directly from the MPC signer contract.
+ * Fetch the authoritative child public key directly from the MPC signer contract.
  * The `derived_public_key` view function applies the same KDF the MPC nodes use
  * internally, so the result is guaranteed to match what actually gets used for signing.
  *
- * Returns the uncompressed secp256k1 public key as a hex string (04 + x + y).
- *
- * NOTE: v1.signer-prod.testnet only supports secp256k1 (key_version: 0). Passing
- * key_version: 1 is silently ignored — the same secp256k1 key is returned.
+ * For key_version 0 (secp256k1): returns uncompressed secp256k1 hex (04 + x + y).
+ * For key_version 1 (Ed25519): returns raw 32-byte Ed25519 public key hex.
  */
-async function fetchDerivedPublicKey(path: string, predecessor: string): Promise<string> {
+async function fetchDerivedPublicKey(
+  path: string,
+  predecessor: string,
+  keyVersion: number = 0
+): Promise<string> {
   const account = await getNearAccount(); // read-only — no private key needed
   const result: string = await account.viewFunction({
     contractId: MPC_CONTRACT_ID,
     methodName: "derived_public_key",
-    args: { path, predecessor },
+    args: { path, predecessor, key_version: keyVersion },
   });
-  // result is "secp256k1:<base58(x||y)>"
+  // result is "secp256k1:<base58(x||y)>" or "ed25519:<base58(key)>"
   return parseMpcPublicKey(result);
 }
 
 export async function deriveUniversalAccountAddresses(): Promise<DerivedAddresses> {
-  console.log("Fetching MPC root public key (secp256k1, key_version: 0)...");
+  console.log("Fetching MPC root public key...");
   const rawMpcKey = await fetchMpcPublicKey();
   console.log("  Raw MPC public key:", rawMpcKey);
 
@@ -189,14 +203,14 @@ export async function deriveUniversalAccountAddresses(): Promise<DerivedAddresse
   console.log("    EVM:", DERIVATION_PATHS.ethereum);
   console.log("    XLM:", DERIVATION_PATHS.stellar);
 
-  // Use derived_public_key from the MPC contract — this is the ground-truth child key
-  // that the MPC nodes actually sign with.  Local KDF re-implementation diverges from
-  // the MPC's internal formula, so we always fetch authoritative values here.
-  const evmChildHex = await fetchDerivedPublicKey(DERIVATION_PATHS.ethereum, NEAR_ACCOUNT_ID);
-  const xlmChildHex = await fetchDerivedPublicKey(DERIVATION_PATHS.stellar, NEAR_ACCOUNT_ID);
+  // EVM: key_version 0 (secp256k1)
+  const evmChildHex = await fetchDerivedPublicKey(DERIVATION_PATHS.ethereum, NEAR_ACCOUNT_ID, 0);
+
+  // Stellar: key_version 1 (Ed25519) — MPC natively derives Ed25519 public key
+  const xlmEd25519Hex = await fetchDerivedPublicKey(DERIVATION_PATHS.stellar, NEAR_ACCOUNT_ID, 1);
 
   const evmAddress = publicKeyToEvmAddress(evmChildHex);
-  const stellar = publicKeyToStellarAddress(xlmChildHex);
+  const stellar = ed25519PublicKeyToStellarAddress(xlmEd25519Hex);
 
   return {
     evm: {
@@ -207,7 +221,6 @@ export async function deriveUniversalAccountAddresses(): Promise<DerivedAddresse
     stellar: {
       address: stellar.address,
       ed25519PublicKeyHex: stellar.ed25519PublicKeyHex,
-      secp256k1PublicKeyHex: xlmChildHex,
       derivationPath: DERIVATION_PATHS.stellar,
     },
     mpcRootPublicKey: rawMpcKey,

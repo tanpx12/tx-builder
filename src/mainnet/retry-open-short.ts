@@ -18,8 +18,7 @@ import {
   UNTANGLED_LOOP_CONTRACT,
   BLEND_POOL_CONTRACT,
 } from "./config.js";
-import { deriveMainnetAddresses } from "./near.js";
-import { deriveKeypairFromPublicKey } from "../core/stellar.js";
+import { deriveMainnetAddresses, getMainnetAccount, signStellarTransactionViaMpc } from "./near.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -81,6 +80,9 @@ function buildSwapChainScVal(swapChain: SwapHopDecoded[]): xdr.ScVal {
 // ── Main ──
 
 async function main() {
+  const nearKey = process.env.MAINNET_KEY;
+  if (!nearKey) { console.error('MAINNET_KEY not set.'); process.exit(1); }
+
   const flashXlm = process.argv[2] ?? "15";
   const marginUsdc = process.argv[3] ?? "3.4";
 
@@ -92,7 +94,7 @@ async function main() {
 
   const addrs = await deriveMainnetAddresses();
   console.log(`Stellar: ${addrs.stellar.address}`);
-  const keypair = deriveKeypairFromPublicKey(addrs.stellar.secp256k1PublicKeyHex);
+  const account = await getMainnetAccount(nearKey);
   const sorobanServer = new rpc.Server(STELLAR_SOROBAN_RPC);
 
   // Get swap quote
@@ -131,7 +133,7 @@ async function main() {
     .build();
 
   const preparedApprove = await sorobanServer.prepareTransaction(approveTx);
-  preparedApprove.sign(keypair);
+  await signStellarTransactionViaMpc(account, preparedApprove, addrs.stellar.ed25519PublicKeyHex);
   const approveResult = await sorobanServer.sendTransaction(preparedApprove);
   console.log(`  Approve tx: ${approveResult.hash}`);
 
@@ -191,7 +193,7 @@ async function main() {
         .addOperation(Operation.restoreFootprint({}))
         .setTimeout(300)
         .build();
-      restoreTx.sign(keypair);
+      await signStellarTransactionViaMpc(account, restoreTx, addrs.stellar.ed25519PublicKeyHex);
       const restoreResult = await sorobanServer.sendTransaction(restoreTx);
       console.log(`Restore tx: ${restoreResult.hash}`);
       for (let i = 0; i < 30; i++) {
@@ -217,7 +219,7 @@ async function main() {
       }
       const assembled = rpc.assembleTransaction(retryTx, retrySimResult);
       const prepared = assembled.build();
-      prepared.sign(keypair);
+      await signStellarTransactionViaMpc(account, prepared, addrs.stellar.ed25519PublicKeyHex);
       const sendResult = await sorobanServer.sendTransaction(prepared);
       console.log(`Tx: ${sendResult.hash}, status: ${sendResult.status}`);
       await pollTx(sorobanServer, sendResult.hash);
@@ -239,7 +241,7 @@ async function main() {
       .setSorobanData(simResult.restorePreamble.transactionData)
       .addOperation(Operation.restoreFootprint({}))
       .setTimeout(300).build();
-    restoreTx.sign(keypair);
+    await signStellarTransactionViaMpc(account, restoreTx, addrs.stellar.ed25519PublicKeyHex);
     const restoreResult = await sorobanServer.sendTransaction(restoreTx);
     console.log(`Restore: ${restoreResult.hash}`);
     await pollTx(sorobanServer, restoreResult.hash);
@@ -259,7 +261,7 @@ async function main() {
     }
     const assembled = rpc.assembleTransaction(retryTx, retrySimResult);
     const prepared = assembled.build();
-    prepared.sign(keypair);
+    await signStellarTransactionViaMpc(account, prepared, addrs.stellar.ed25519PublicKeyHex);
     const sendResult = await sorobanServer.sendTransaction(prepared);
     console.log(`Tx: ${sendResult.hash}, status: ${sendResult.status}`);
     await pollTx(sorobanServer, sendResult.hash);
@@ -267,7 +269,7 @@ async function main() {
     // Success path
     const assembled = rpc.assembleTransaction(openShortTx, simResult);
     const prepared = assembled.build();
-    prepared.sign(keypair);
+    await signStellarTransactionViaMpc(account, prepared, addrs.stellar.ed25519PublicKeyHex);
     console.log("Submitting open_short...");
     const sendResult = await sorobanServer.sendTransaction(prepared);
     console.log(`Tx: ${sendResult.hash}, status: ${sendResult.status}`);

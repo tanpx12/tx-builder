@@ -1,56 +1,100 @@
 // ──────────────────────────────────────────────
-// Stellar (Testnet) – build & sign test transaction
+// Stellar – build & sign transactions via MPC Ed25519
+//
+// The MPC signer supports Ed25519 natively (domain_id/key_version: 1).
+// Stellar transactions are signed by requesting an Ed25519 signature from
+// the MPC, then attaching the 64-byte (R || S) signature to the transaction
+// envelope. No local keypair is involved.
 // ──────────────────────────────────────────────
 
 import {
-  Keypair,
   TransactionBuilder,
   Networks,
   Operation,
   Asset,
   Account,
   Memo,
+  Transaction,
+  xdr,
 } from "@stellar/stellar-sdk";
-import { sha256 } from "js-sha256";
-import elliptic from "elliptic";
-
-const { ec: EC } = elliptic;
 
 import { STELLAR_HORIZON, STELLAR_NETWORK_PASSPHRASE } from "./config.js";
 import { requestSignature } from "./near.js";
 
-const secp256k1 = new EC("secp256k1");
+/**
+ * MPC signature response shape for Ed25519.
+ * big_r.affine_point contains the R component (may have a prefix byte).
+ * s.scalar contains the S component.
+ * Together they form the 64-byte Ed25519 signature (R || S).
+ */
+export interface MpcEd25519Signature {
+  big_r: { affine_point: string };
+  s: { scalar: string };
+  recovery_id: number;
+}
 
 /**
- * For Stellar, the asset-manager contract uses domain_id=1 (Ed25519).
- * The MPC signer derives an Ed25519 keypair from the derivation path,
- * so the resulting Stellar address is an Ed25519 public key.
+ * Extract a 64-byte Ed25519 signature (R || S) from the MPC response.
  *
- * The address derivation uses the same KDF as secp256k1 but produces
- * an Ed25519 public key. For client-side derivation, we hash the
- * secp256k1 child key to get a deterministic Ed25519 seed.
+ * The MPC returns big_r.affine_point as a hex string that may have a
+ * compressed-key prefix byte (02/03). For Ed25519, R is 32 bytes.
+ * If the affine_point is 66 hex chars (33 bytes with prefix), strip the
+ * first byte. S is always 32 bytes from s.scalar.
  */
+export function extractEd25519Signature(sig: MpcEd25519Signature): Buffer {
+  let rHex = sig.big_r.affine_point;
+  // Strip compressed-key prefix byte if present (33 bytes = 66 hex chars)
+  if (rHex.length === 66) {
+    rHex = rHex.slice(2);
+  }
+  const sHex = sig.s.scalar;
 
-/**
- * Compress a secp256k1 public key
- */
-function compressPublicKey(uncompressedHex: string): Buffer {
-  const point = secp256k1.keyFromPublic(uncompressedHex, "hex").getPublic();
-  return Buffer.from(point.encodeCompressed("hex"), "hex");
+  const r = Buffer.from(rHex, "hex");
+  const s = Buffer.from(sHex, "hex");
+
+  if (r.length !== 32) {
+    throw new Error(`Expected 32-byte R, got ${r.length} bytes (hex: ${rHex})`);
+  }
+  if (s.length !== 32) {
+    throw new Error(`Expected 32-byte S, got ${s.length} bytes (hex: ${sHex})`);
+  }
+
+  return Buffer.concat([r, s]);
 }
 
 /**
- * Derive a Stellar keypair from the secp256k1 public key.
- * Takes SHA-256 of the compressed secp256k1 key as a 32-byte Ed25519 seed.
+ * Attach an MPC Ed25519 signature to a Stellar transaction.
+ *
+ * This creates a DecoratedSignature with the last 4 bytes of the Ed25519
+ * public key as the hint, and the 64-byte (R || S) signature as the value.
  */
-export function deriveKeypairFromPublicKey(publicKeyHex: string): Keypair {
-  const compressed = compressPublicKey(publicKeyHex);
-  const seed = Buffer.from(sha256.arrayBuffer(compressed)).slice(0, 32);
-  return Keypair.fromRawEd25519Seed(seed);
+export function attachMpcEd25519Signature(
+  tx: Transaction,
+  ed25519PublicKeyHex: string,
+  mpcSig: MpcEd25519Signature
+): void {
+  const sigBytes = extractEd25519Signature(mpcSig);
+  const pubKeyBytes = Buffer.from(ed25519PublicKeyHex, "hex");
+
+  // Signature hint = last 4 bytes of the Ed25519 public key
+  const hint = pubKeyBytes.subarray(pubKeyBytes.length - 4);
+
+  const decoratedSig = new xdr.DecoratedSignature({
+    hint: xdr.SignatureHint.fromXDR(hint),
+    signature: sigBytes,
+  });
+
+  // Access the envelope and append the signature
+  const envelope = tx.toEnvelope();
+  if (envelope.switch() === xdr.EnvelopeType.envelopeTypeTxV0()) {
+    envelope.v0().signatures().push(decoratedSig);
+  } else {
+    envelope.v1().signatures().push(decoratedSig);
+  }
 }
 
 /**
- * Build a minimal Stellar test transaction (self-payment of 0 XLM).
+ * Build a minimal Stellar test transaction (self-payment of 0.0001 XLM).
  * Uses a dummy sequence number since we may not have a funded account.
  */
 export function buildStellarTestTx(stellarAddress: string) {
@@ -90,38 +134,33 @@ export function buildStellarTestTx(stellarAddress: string) {
 }
 
 /**
- * Sign the Stellar test transaction.
+ * Sign a Stellar test transaction via MPC Ed25519.
  *
- * The asset-manager contract sends domain_id=1 (Ed25519) to the MPC signer.
- * The MPC signer produces an Ed25519 signature directly.
- *
- * For this test we also demonstrate local signing with the derived keypair.
+ * Requests an Ed25519 signature from the MPC signer (key_version: 1)
+ * and attaches it to the Stellar transaction envelope.
  */
 export async function signStellarTx(
   stellarAddress: string,
-  publicKeyHex: string,
+  ed25519PublicKeyHex: string,
   nearPrivateKey?: string
 ): Promise<string> {
   const { tx, payload, txHash } = buildStellarTestTx(stellarAddress);
 
-  // Approach (b): Sign with the derived Ed25519 keypair
-  const keypair = deriveKeypairFromPublicKey(publicKeyHex);
-  tx.sign(keypair);
-
-  console.log("\n  Signed with derived Ed25519 keypair");
-  console.log("  XDR (signed):", tx.toXDR());
-
-  // If a NEAR private key is provided, also demonstrate the MPC signature request
   if (nearPrivateKey) {
-    console.log("\n  Additionally requesting signature via testnet-deployer.testnet contract (Ed25519)...");
+    console.log("\n  Requesting Ed25519 signature from MPC signer...");
     try {
       const sig = await requestSignature(payload, "Stellar", nearPrivateKey);
-      console.log("  MPC signature received:");
+      console.log("  MPC Ed25519 signature received:");
       console.log("    big_r:", JSON.stringify(sig.big_r));
       console.log("    s:", sig.s);
       console.log("    recovery_id:", sig.recovery_id);
+
+      // Attach the MPC Ed25519 signature to the transaction
+      attachMpcEd25519Signature(tx, ed25519PublicKeyHex, sig);
+      console.log("  Signature attached to transaction envelope.");
+      console.log("  XDR (signed):", tx.toXDR());
     } catch (e: any) {
-      console.log("  MPC signature request failed (expected if no NEAR key):", e.message);
+      console.log("  MPC signature request failed:", e.message);
     }
   } else {
     console.log("\n  Skipping MPC signature (no NEAR private key provided).");

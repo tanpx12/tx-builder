@@ -1,5 +1,5 @@
 // src/mainnet/open-position.ts
-// Open Position Flow: EVM → Stellar (single-input)
+// Open Position Flow: EVM -> Stellar (single-input)
 //
 // All parameters derive from a single --weth input:
 //   1. Supply WETH collateral on Morpho
@@ -60,6 +60,7 @@ import {
   pollBatchStatus,
   getBatchSignatures,
   refundBatch,
+  signStellarTransactionViaMpc,
   type MpcSignature,
 } from "./near.js";
 import {
@@ -74,7 +75,7 @@ import {
   submitDeposit,
   pollBridgeStatus,
 } from "./bridge.js";
-import { deriveKeypairFromPublicKey } from "../core/stellar.js";
+import { attachMpcEd25519Signature, type MpcEd25519Signature } from "../core/stellar.js";
 import { TxLog } from "./tx-log.js";
 
 const txLog = new TxLog("Open Leveraged Short Position");
@@ -168,10 +169,14 @@ function buildSwapChainScVal(swapChain: SwapHopDecoded[]): xdr.ScVal {
 // ── Soroban tx helpers ──
 
 async function sendSorobanTx(
-  server: rpc.Server, keypair: any, tx: any, label: string,
+  server: rpc.Server,
+  nearAccount: Awaited<ReturnType<typeof getMainnetAccount>>,
+  ed25519PublicKeyHex: string,
+  tx: any,
+  label: string,
 ): Promise<{ hash: string; success: boolean }> {
   const prepared = await server.prepareTransaction(tx);
-  prepared.sign(keypair);
+  await signStellarTransactionViaMpc(nearAccount, prepared, ed25519PublicKeyHex);
   const result = await server.sendTransaction(prepared);
   console.log(`    ${label} tx: ${result.hash}`);
   for (let i = 0; i < 30; i++) {
@@ -323,7 +328,7 @@ async function main() {
   console.log(`  Deposit address: ${bridgeQuote.depositAddress}\n`);
 
   // ── Step 3: Get Aquarius swap quote for actual flash amount ──
-  console.log("Step 3 — Getting swap quote (XLM → USDC) for flash loan...");
+  console.log("Step 3 — Getting swap quote (XLM -> USDC) for flash loan...");
   const aquariusQuote = await getAquariusQuote(STELLAR_XLM_TOKEN, STELLAR_USDC_TOKEN, flashStroops.toString());
   const minSwapOutput = (aquariusQuote.estimatedOutput * 99n) / 100n;
   console.log(`  Flash:       ${Number(flashStroops) / 1e7} XLM`);
@@ -357,7 +362,7 @@ async function main() {
   }
 
   // 1. Approve WETH for Morpho
-  addEvmPayload("Approve WETH → Morpho", WETH_ADDRESS, buildApproveWethCalldata(wethRaw));
+  addEvmPayload("Approve WETH -> Morpho", WETH_ADDRESS, buildApproveWethCalldata(wethRaw));
 
   // 2. Supply WETH collateral
   addEvmPayload("Supply WETH collateral", MORPHO_ADDRESS,
@@ -368,7 +373,7 @@ async function main() {
     buildBorrowCalldata(marketParams, borrowUsdc, addrs.evm.address, addrs.evm.address), 300000);
 
   // 4. Transfer USDC to bridge
-  addEvmPayload("USDC → bridge", USDC_ADDRESS,
+  addEvmPayload("USDC -> bridge", USDC_ADDRESS,
     buildUsdcTransferCalldata(bridgeQuote.depositAddress, bridgeUsdc));
 
   // Stellar change_trust payload (for MPC batch)
@@ -459,12 +464,10 @@ async function main() {
   // [0] = change_trust, [1..N] = EVM txs, [last] = open_short
   const changeTrustSig = signatures[0]!;
   const evmSigs = signatures.slice(1, 1 + evmPayloads.length);
-  // open_short sig at signatures[last] — not used (we sign locally via Soroban)
+  // open_short sig at signatures[last] — not used (we simulate + sign fresh via MPC)
 
   // ── Step 9: Broadcast ──
   console.log("Step 9 — Broadcasting transactions...\n");
-
-  const keypair = deriveKeypairFromPublicKey(addrs.stellar.secp256k1PublicKeyHex);
 
   // 9a: Stellar change_trust USDC
   console.log("  9a. Stellar change_trust USDC...");
@@ -489,7 +492,8 @@ async function main() {
     const trustTx = new TransactionBuilder(trustAccount, { fee: "100", networkPassphrase: Networks.PUBLIC })
       .addOperation(Operation.changeTrust({ asset: new Asset("USDC", USDC_ISSUER_STRKEY) }))
       .setTimeout(0).build();
-    trustTx.sign(keypair);
+    // Attach MPC Ed25519 signature from batch
+    attachMpcEd25519Signature(trustTx, addrs.stellar.ed25519PublicKeyHex, changeTrustSig as MpcEd25519Signature);
     try {
       const submitRes = await fetch(`${STELLAR_MAINNET_HORIZON}/transactions`, {
         method: "POST",
@@ -560,9 +564,6 @@ async function main() {
 
   // 9c: Submit bridge deposit + wait
   console.log("  Submitting bridge deposit to 1Click...");
-  // The last EVM tx was the USDC transfer — get its hash
-  // We can re-derive it, but simpler: the last broadcastTransaction was for bridge transfer
-  // Actually we need the hash. Let's get it from the nonce.
   const bridgeEvmPayload = evmPayloads[evmPayloads.length - 1];
   const bridgeSig = evmSigs[evmSigs.length - 1]!;
   const bridgeUnsigned = ethers.Transaction.from({
@@ -577,15 +578,15 @@ async function main() {
   const bridgeTxHash = ethers.keccak256(bridgeSignedTx.serialized);
   await submitDeposit(bridgeQuote.depositAddress, bridgeTxHash);
 
-  console.log("  Waiting for bridge (USDC Arbitrum → Stellar)...");
+  console.log("  Waiting for bridge (USDC Arbitrum -> Stellar)...");
   const bridgeResult = await pollBridgeStatus(bridgeQuote.depositAddress);
   if (bridgeResult !== "SUCCESS") {
     console.error(`  Bridge ${bridgeResult}. Cannot proceed.`);
-    txLog.add({ step: "Bridge", chain: "1Click Bridge", description: `USDC Arbitrum → Stellar (${ethers.formatUnits(bridgeUsdc, 6)} USDC)`, status: "failed", details: bridgeResult });
+    txLog.add({ step: "Bridge", chain: "1Click Bridge", description: `USDC Arbitrum -> Stellar (${ethers.formatUnits(bridgeUsdc, 6)} USDC)`, status: "failed", details: bridgeResult });
     process.exit(1);
   }
   console.log("  Bridge completed!\n");
-  txLog.add({ step: "Bridge", chain: "1Click Bridge", description: `USDC Arbitrum → Stellar (${ethers.formatUnits(bridgeUsdc, 6)} USDC)`, status: "success" });
+  txLog.add({ step: "Bridge", chain: "1Click Bridge", description: `USDC Arbitrum -> Stellar (${ethers.formatUnits(bridgeUsdc, 6)} USDC)`, status: "success" });
 
   // 9d: Check actual USDC balance on Stellar and use as margin
   console.log("  9d. Checking Stellar USDC balance...");
@@ -624,7 +625,7 @@ async function main() {
   console.log(`    Min (1%):    ${Number(freshMinSwapOutput) / 1e7} USDC`);
   console.log(`    Hops:        ${freshQuote.swapChain.length}\n`);
 
-  // 9f: Approve USDC for Blend pool
+  // 9f: Approve USDC for Blend pool (signed via MPC)
   console.log("  9f. Approving USDC for Blend pool...");
   const approveAmount = actualUsdcStroops + freshMinSwapOutput + 10_000_000n;
   const latestLedger = (await sorobanServer.getLatestLedger()).sequence;
@@ -642,10 +643,10 @@ async function main() {
       ],
     }))
     .setTimeout(300).build();
-  const approveResult = await sendSorobanTx(sorobanServer, keypair, approveTx, "Approve USDC");
+  const approveResult = await sendSorobanTx(sorobanServer, account, addrs.stellar.ed25519PublicKeyHex, approveTx, "Approve USDC");
   txLog.add({ step: "Approve USDC", chain: "Stellar", description: `Approve ${Number(approveAmount) / 1e7} USDC for Blend pool`, hash: approveResult.hash, status: approveResult.success ? "success" : "failed" });
 
-  // 9g: Submit open_short
+  // 9g: Submit open_short (signed via MPC)
   console.log("\n  9g. Opening short position...");
   const swapChainScVal = buildSwapChainScVal(freshQuote.swapChain);
   const openShortArgs = [
@@ -681,7 +682,7 @@ async function main() {
         .setSorobanData(rp.transactionData)
         .addOperation(Operation.restoreFootprint({}))
         .setTimeout(300).build();
-      restoreTx.sign(keypair);
+      await signStellarTransactionViaMpc(account, restoreTx, addrs.stellar.ed25519PublicKeyHex);
       const rr = await sorobanServer.sendTransaction(restoreTx);
       for (let i = 0; i < 30; i++) {
         await sleep(2000);
@@ -703,7 +704,7 @@ async function main() {
         process.exit(1);
       }
       const assembled = rpc.assembleTransaction(retryTx, retrySim).build();
-      assembled.sign(keypair);
+      await signStellarTransactionViaMpc(account, assembled, addrs.stellar.ed25519PublicKeyHex);
       const sr = await sorobanServer.sendTransaction(assembled);
       console.log(`    Tx: ${sr.hash}, status: ${sr.status}`);
       let retryOk1 = false;
@@ -737,7 +738,7 @@ async function main() {
       .setSorobanData(simResult.restorePreamble.transactionData)
       .addOperation(Operation.restoreFootprint({}))
       .setTimeout(300).build();
-    restoreTx.sign(keypair);
+    await signStellarTransactionViaMpc(account, restoreTx, addrs.stellar.ed25519PublicKeyHex);
     const rr = await sorobanServer.sendTransaction(restoreTx);
     for (let i = 0; i < 30; i++) {
       await sleep(2000);
@@ -755,7 +756,7 @@ async function main() {
     const retrySim = await sorobanServer.simulateTransaction(retryTx);
     if (rpc.Api.isSimulationError(retrySim)) { console.error("    Re-sim failed:", retrySim.error); process.exit(1); }
     const assembled = rpc.assembleTransaction(retryTx, retrySim).build();
-    assembled.sign(keypair);
+    await signStellarTransactionViaMpc(account, assembled, addrs.stellar.ed25519PublicKeyHex);
     const sr = await sorobanServer.sendTransaction(assembled);
     console.log(`    Tx: ${sr.hash}, status: ${sr.status}`);
     let retryOk2 = false;
@@ -775,7 +776,7 @@ async function main() {
   } else {
     // Normal success
     const assembled = rpc.assembleTransaction(openShortTx, simResult).build();
-    assembled.sign(keypair);
+    await signStellarTransactionViaMpc(account, assembled, addrs.stellar.ed25519PublicKeyHex);
     console.log("    Submitting...");
     const sr = await sorobanServer.sendTransaction(assembled);
     console.log(`    Tx: ${sr.hash}, status: ${sr.status}`);

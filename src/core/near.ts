@@ -4,7 +4,7 @@
 
 import { connect, keyStores, KeyPair } from "near-api-js";
 import type { ConnectConfig } from "near-api-js";
-import { NEAR_RPC, NEAR_ACCOUNT_ID, MPC_CONTRACT_ID } from "./config.js";
+import { NEAR_RPC, NEAR_ACCOUNT_ID, MPC_CONTRACT_ID, DOMAIN_IDS } from "./config.js";
 
 /**
  * Create a NEAR connection and account object.
@@ -30,7 +30,7 @@ export async function getNearAccount(privateKey?: string) {
 
 /**
  * Fetch the MPC root public key from the signer contract (view call).
- * Returns the uncompressed secp256k1 public key as a hex string.
+ * Returns the raw string from the MPC contract (e.g. "secp256k1:BASE58_ENCODED_KEY").
  */
 export async function fetchMpcPublicKey(): Promise<string> {
   const account = await getNearAccount();
@@ -39,7 +39,6 @@ export async function fetchMpcPublicKey(): Promise<string> {
     methodName: "public_key",
     args: {},
   });
-  // result is typically "secp256k1:BASE58_ENCODED_KEY"
   return result;
 }
 
@@ -79,6 +78,17 @@ const CHAIN_PATH_PREFIX: Record<ChainType, string> = {
 };
 
 /**
+ * Map chain type to the MPC key_version (domain_id).
+ *   0 = Secp256k1 (Ethereum, Bitcoin)
+ *   1 = Ed25519   (Stellar)
+ */
+const CHAIN_KEY_VERSION: Record<ChainType, number> = {
+  Ethereum: DOMAIN_IDS.ethereum,
+  Bitcoin: DOMAIN_IDS.bitcoin,
+  Stellar: DOMAIN_IDS.stellar,
+};
+
+/**
  * Request a chain signature by calling the MPC signer contract DIRECTLY.
  *
  * This bypasses the asset-manager intermediary contract, giving the full
@@ -89,7 +99,9 @@ const CHAIN_PATH_PREFIX: Record<ChainType, string> = {
  * `chainType` is the chain enum variant.
  * `derivationIndex` defaults to 0.
  *
- * Returns { big_r, s, recovery_id } (the MPC signature).
+ * For Ethereum/Bitcoin: key_version=0 (secp256k1), returns { big_r, s, recovery_id }.
+ * For Stellar: key_version=1 (Ed25519), returns { big_r, s, recovery_id } where
+ *   big_r contains the 32-byte R and s contains the 32-byte S of the Ed25519 signature.
  */
 export async function requestSignature(
   payload: number[],
@@ -104,6 +116,9 @@ export async function requestSignature(
   const chainPrefix = CHAIN_PATH_PREFIX[chainType];
   const path = `${NEAR_ACCOUNT_ID},${NEAR_ACCOUNT_ID},${chainPrefix},${derivationIndex}`;
 
+  // Select key_version based on chain type
+  const keyVersion = CHAIN_KEY_VERSION[chainType];
+
   // Deposit 0.25 NEAR — the MPC signer requires a meaningful deposit.
   // Excess is refunded.
   const SIGN_DEPOSIT = BigInt("250000000000000000000000"); // 0.25 NEAR
@@ -115,7 +130,7 @@ export async function requestSignature(
       request: {
         payload,
         path,
-        key_version: 0,
+        key_version: keyVersion,
       },
     },
     gas: BigInt("300000000000000"), // 300 Tgas — all for the MPC signer

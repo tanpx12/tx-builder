@@ -1,11 +1,11 @@
 // src/mainnet/close-position.ts
-// Close Position Flow: Stellar → EVM (fully automated)
+// Close Position Flow: Stellar -> EVM (fully automated)
 //
 // Steps:
 //   1. Record pre-close XLM balance on Stellar
-//   2. Close short on Blend (flash USDC → swap to XLM → repay debt → withdraw collateral)
+//   2. Close short on Blend (flash USDC -> swap to XLM -> repay debt -> withdraw collateral)
 //   3. Withdraw residual Blend collateral (if any)
-//   4. Swap ONLY the new XLM (current - original) → USDC via Aquarius AMM
+//   4. Swap ONLY the new XLM (current - original) -> USDC via Aquarius AMM
 //   5. Bridge ALL Stellar USDC to Arbitrum via 1Click
 //   6. Repay Morpho USDC debt + Withdraw WETH collateral (NEAR batch sign)
 //
@@ -51,6 +51,7 @@ import {
   pollBatchStatus,
   getBatchSignatures,
   refundBatch,
+  signStellarTransactionViaMpc,
   type MpcSignature,
 } from "./near.js";
 import {
@@ -66,7 +67,7 @@ import {
   submitDeposit,
   pollBridgeStatus,
 } from "./bridge.js";
-import { deriveKeypairFromPublicKey } from "../core/stellar.js";
+import { attachMpcEd25519Signature, type MpcEd25519Signature } from "../core/stellar.js";
 import { TxLog } from "./tx-log.js";
 
 const txLog = new TxLog("Close Leveraged Short Position");
@@ -203,11 +204,16 @@ async function queryBlendPosition(server: rpc.Server, userAddress: string) {
 // ── Soroban tx helpers ──
 
 async function sendSorobanTx(
-  server: rpc.Server, keypair: any, buildTx: (account: any) => any, label: string,
+  server: rpc.Server,
+  nearAccount: Awaited<ReturnType<typeof getMainnetAccount>>,
+  ed25519PublicKeyHex: string,
+  buildTx: (account: any) => any,
+  label: string,
 ): Promise<{ hash: string; success: boolean }> {
-  const tx = buildTx(await server.getAccount(keypair.publicKey()));
+  const stellarAddress = StrKey.encodeEd25519PublicKey(Buffer.from(ed25519PublicKeyHex, "hex"));
+  const tx = buildTx(await server.getAccount(stellarAddress));
   const prepared = await server.prepareTransaction(tx);
-  prepared.sign(keypair);
+  await signStellarTransactionViaMpc(nearAccount, prepared, ed25519PublicKeyHex);
   const result = await server.sendTransaction(prepared);
   console.log(`    ${label} tx: ${result.hash}`);
   for (let i = 0; i < 30; i++) {
@@ -278,7 +284,7 @@ async function main() {
   txLog.setAddress("EVM (Arbitrum)", addrs.evm.address);
   txLog.setAddress("Stellar", addrs.stellar.address);
 
-  const stellarKeypair = deriveKeypairFromPublicKey(addrs.stellar.secp256k1PublicKeyHex);
+  const nearAccount = await getMainnetAccount(nearKey);
   const sorobanServer = new rpc.Server(STELLAR_SOROBAN_RPC);
   const provider = new ethers.JsonRpcProvider(ARB_RPC);
 
@@ -309,7 +315,7 @@ async function main() {
           new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("amount"), val: nativeToScVal(position.usdcCollateral, { type: "i128" }) }),
           new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("request_type"), val: nativeToScVal(3, { type: "u32" }) }),
         ]);
-        const withdrawResult = await sendSorobanTx(sorobanServer, stellarKeypair, (acct) =>
+        const withdrawResult = await sendSorobanTx(sorobanServer, nearAccount, addrs.stellar.ed25519PublicKeyHex, (acct) =>
           new TransactionBuilder(acct, { fee: "10000000", networkPassphrase: Networks.PUBLIC })
             .addOperation(Operation.invokeContractFunction({
               contract: BLEND_POOL_CONTRACT, function: "submit",
@@ -330,7 +336,7 @@ async function main() {
       const xlmDebtWithBuffer = (position.xlmDebt * 101n) / 100n;
       const flashAmountUsdc = position.usdcCollateral;
 
-      console.log(`\n  Getting swap quote (USDC → XLM)...`);
+      console.log(`\n  Getting swap quote (USDC -> XLM)...`);
       const quote = await getAquariusQuote(STELLAR_USDC_TOKEN, STELLAR_XLM_TOKEN, flashAmountUsdc.toString());
       console.log(`  Estimated XLM out: ${Number(quote.estimatedOutput) / 1e7}`);
       console.log(`  XLM debt + 1%:     ${Number(xlmDebtWithBuffer) / 1e7}`);
@@ -338,7 +344,7 @@ async function main() {
       if (!doSubmit) {
         console.log("  (dry-run)\n");
       } else {
-        // Approve XLM + USDC for Blend pool
+        // Approve XLM + USDC for Blend pool (via MPC)
         const latestLedger = (await sorobanServer.getLatestLedger()).sequence;
         const expLedger = Number(latestLedger) + 1000;
 
@@ -347,7 +353,7 @@ async function main() {
           [STELLAR_USDC_TOKEN, flashAmountUsdc * 2n + 10_000_000n, "USDC"] as const,
         ]) {
           console.log(`  Approving ${label}...`);
-          const approveRes = await sendSorobanTx(sorobanServer, stellarKeypair, (acct) =>
+          const approveRes = await sendSorobanTx(sorobanServer, nearAccount, addrs.stellar.ed25519PublicKeyHex, (acct) =>
             new TransactionBuilder(acct, { fee: "10000000", networkPassphrase: Networks.PUBLIC })
               .addOperation(Operation.invokeContractFunction({
                 contract: token, function: "approve",
@@ -362,10 +368,10 @@ async function main() {
           txLog.add({ step: `Approve ${label}`, chain: "Stellar", description: `Approve ${label} for Blend pool`, hash: approveRes.hash, status: approveRes.success ? "success" : "failed" });
         }
 
-        // Submit close_short
+        // Submit close_short (via MPC)
         console.log(`\n  Submitting close_short...`);
         const swapChainVal = buildSwapChainScVal(quote.swapChain);
-        const closeResult = await sendSorobanTx(sorobanServer, stellarKeypair, (acct) =>
+        const closeResult = await sendSorobanTx(sorobanServer, nearAccount, addrs.stellar.ed25519PublicKeyHex, (acct) =>
           new TransactionBuilder(acct, { fee: "20000000", networkPassphrase: Networks.PUBLIC })
             .addOperation(Operation.invokeContractFunction({
               contract: UNTANGLED_LOOP_CONTRACT, function: "close_short",
@@ -388,9 +394,9 @@ async function main() {
     console.log("Step 1 — Skipping close_short (--skip-close)\n");
   }
 
-  // ── Step 2: Swap only NEW XLM → USDC ──
+  // ── Step 2: Swap only NEW XLM -> USDC ──
   if (!skipBridge && doSubmit) {
-    console.log("Step 2 — Swapping new XLM → USDC...\n");
+    console.log("Step 2 — Swapping new XLM -> USDC...\n");
 
     const postCloseXlm = await querySorobanBalance(sorobanServer, addrs.stellar.address, STELLAR_XLM_TOKEN);
     const newXlm = postCloseXlm - preCloseXlm;
@@ -401,7 +407,7 @@ async function main() {
 
     if (newXlm > 10_000_000n) { // > 1 XLM
       // Use Aquarius AMM via Soroban for the swap (avoids Horizon dependency)
-      console.log(`\n  Getting Aquarius quote (${Number(newXlm) / 1e7} XLM → USDC)...`);
+      console.log(`\n  Getting Aquarius quote (${Number(newXlm) / 1e7} XLM -> USDC)...`);
       const swapQuote = await getAquariusQuote(STELLAR_XLM_TOKEN, STELLAR_USDC_TOKEN, newXlm.toString());
       const minOut = (swapQuote.estimatedOutput * 98n) / 100n; // 2% slippage
       console.log(`  Estimated USDC: ${Number(swapQuote.estimatedOutput) / 1e7}`);
@@ -423,10 +429,10 @@ async function main() {
           destMin: minDest,
         }))
         .setTimeout(300).build();
-      swapTx.sign(stellarKeypair);
+      await signStellarTransactionViaMpc(nearAccount, swapTx, addrs.stellar.ed25519PublicKeyHex);
 
-      const swapResult = await submitHorizonTx(swapTx.toEnvelope().toXDR("base64"), "XLM→USDC swap");
-      txLog.add({ step: "Swap XLM→USDC", chain: "Stellar", description: `Swap ${Number(newXlm) / 1e7} XLM → USDC`, hash: swapResult.hash, status: swapResult.success ? "success" : "pending" });
+      const swapResult = await submitHorizonTx(swapTx.toEnvelope().toXDR("base64"), "XLM->USDC swap");
+      txLog.add({ step: "Swap XLM->USDC", chain: "Stellar", description: `Swap ${Number(newXlm) / 1e7} XLM -> USDC`, hash: swapResult.hash, status: swapResult.success ? "success" : "pending" });
       if (!swapResult.success) {
         // Retry with Horizon path finding
         console.log("    Retrying with path hints...");
@@ -454,8 +460,8 @@ async function main() {
                 ),
               }))
               .setTimeout(300).build();
-            swapTx2.sign(stellarKeypair);
-            await submitHorizonTx(swapTx2.toEnvelope().toXDR("base64"), "XLM→USDC swap (retry)");
+            await signStellarTransactionViaMpc(nearAccount, swapTx2, addrs.stellar.ed25519PublicKeyHex);
+            await submitHorizonTx(swapTx2.toEnvelope().toXDR("base64"), "XLM->USDC swap (retry)");
           } else {
             console.log("    No paths found. Skipping swap.\n");
           }
@@ -472,7 +478,7 @@ async function main() {
   } else if (!skipBridge) {
     // Dry-run estimate
     const postCloseXlmEst = preCloseXlm; // can't know without executing
-    console.log("Step 2 — XLM → USDC swap (will calculate after close_short)\n");
+    console.log("Step 2 — XLM -> USDC swap (will calculate after close_short)\n");
   }
 
   // ── Step 3: Bridge ALL Stellar USDC to Arbitrum ──
@@ -499,7 +505,7 @@ async function main() {
       if (!doSubmit) {
         console.log("  (dry-run)\n");
       } else {
-        // Send Stellar USDC payment to bridge deposit address
+        // Send Stellar USDC payment to bridge deposit address (via MPC)
         console.log("\n  Sending USDC to bridge...");
         const freshAccount = await sorobanServer.getAccount(addrs.stellar.address);
         const paymentTx = new TransactionBuilder(freshAccount, {
@@ -512,7 +518,7 @@ async function main() {
           }))
           .addMemo(bridgeQuote.memo ? Memo.text(bridgeQuote.memo) : Memo.none())
           .setTimeout(300).build();
-        paymentTx.sign(stellarKeypair);
+        await signStellarTransactionViaMpc(nearAccount, paymentTx, addrs.stellar.ed25519PublicKeyHex);
 
         const payResult = await submitHorizonTx(paymentTx.toEnvelope().toXDR("base64"), "USDC payment");
         txLog.add({ step: "Bridge payment", chain: "Stellar", description: `Send ${Number(bridgeStroops) / 1e7} USDC to bridge`, hash: payResult.hash, status: payResult.success ? "success" : "failed" });
@@ -521,10 +527,10 @@ async function main() {
           await submitDeposit(bridgeQuote.depositAddress, payResult.hash);
         }
 
-        console.log("  Waiting for bridge (Stellar → Arbitrum)...");
+        console.log("  Waiting for bridge (Stellar -> Arbitrum)...");
         const bridgeResult = await pollBridgeStatus(bridgeQuote.depositAddress, bridgeQuote.memo);
         console.log(`  Bridge: ${bridgeResult}\n`);
-        txLog.add({ step: "Bridge", chain: "1Click Bridge", description: `USDC Stellar → Arbitrum (${Number(bridgeStroops) / 1e7} USDC)`, status: bridgeResult === "SUCCESS" ? "success" : "failed", details: bridgeResult });
+        txLog.add({ step: "Bridge", chain: "1Click Bridge", description: `USDC Stellar -> Arbitrum (${Number(bridgeStroops) / 1e7} USDC)`, status: bridgeResult === "SUCCESS" ? "success" : "failed", details: bridgeResult });
 
         if (bridgeResult !== "SUCCESS") {
           throw new Error(`Bridge failed: ${bridgeResult}`);

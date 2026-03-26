@@ -2,7 +2,7 @@
 // F.2 — E2E Demo: Send 1 XLM via Universal Account Contract
 //
 // Flow:
-//   1. Derive Stellar address from MPC key (Ed25519 via secp256k1 KDF)
+//   1. Derive Stellar address from MPC Ed25519 key (key_version: 1)
 //   2. Fetch sequence number + XLM balance from Stellar Horizon
 //   3. Connect to NEAR + get next request_id
 //   4. Build and register policy (native XLM payment to RECIPIENT)
@@ -10,7 +10,8 @@
 //   6. Propose StellarPayment tx to the asset-manager contract
 //      via request_signature()
 //   7. Poll get_signature_request() until MPC Ed25519 signature is ready
-//   8. Reconstruct signed Stellar transaction (attach 64-byte Ed25519 sig)
+//   8. Reconstruct signed Stellar transaction (attach 64-byte Ed25519 sig
+//      from MPC response)
 //   9. Submit to Stellar Horizon testnet + wait for confirmation
 //
 // Policy step (4-5) ensures the contract's policy engine gates this
@@ -18,7 +19,7 @@
 //   chain=Stellar, contract=source_ed25519_hex, selector="payment" bytes
 // Policy bytes: 88-byte layout — [0..32] destination key, [32..36] asset type,
 //   [36..48] asset code, [48..80] issuer, [80..88] amount.
-// Mask enforces: destination (0xFF×32) + native asset type (0xFF×4) + rest=0x00
+// Mask enforces: destination (0xFF x 32) + native asset type (0xFF x 4) + rest=0x00
 //
 // Usage:
 //   npx tsx src/demo-stellar-payment.ts
@@ -41,7 +42,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { transactions, utils } from "near-api-js";
 import { deriveUniversalAccountAddresses } from "../core/derive.js";
-import { deriveKeypairFromPublicKey } from "../core/stellar.js";
+import { attachMpcEd25519Signature } from "../core/stellar.js";
 import { getNearAccount } from "../core/near.js";
 import { STELLAR_HORIZON, NEAR_ACCOUNT_ID } from "../core/config.js";
 
@@ -213,22 +214,21 @@ async function pollSignatureRequest(
 async function main() {
   const nearKey = process.env.KEY;
   if (!nearKey) {
-    console.error('❌  KEY not set. Add KEY="ed25519:..." to .env');
+    console.error('ERROR: KEY not set. Add KEY="ed25519:..." to .env');
     process.exit(1);
   }
 
-  console.log("╔══════════════════════════════════════════════════╗");
-  console.log("║  F.2 — Send 1 XLM via Universal Account         ║");
-  console.log("╚══════════════════════════════════════════════════╝\n");
+  console.log("+==========================================================+");
+  console.log("|  F.2 — Send 1 XLM via Universal Account                  |");
+  console.log("+==========================================================+\n");
 
   // ── Step 1: Derive Stellar address ───────────────────────────
-  console.log("Step 1 — Deriving Stellar address from MPC key...");
+  console.log("Step 1 — Deriving Stellar address from MPC Ed25519 key...");
   const { stellar } = await deriveUniversalAccountAddresses();
   const sourceAddress = stellar.address; // G... StrKey
   const sourceEd25519Hex = stellar.ed25519PublicKeyHex; // raw 32-byte hex
-  const sourceSecp256k1Hex = stellar.secp256k1PublicKeyHex; // for local Ed25519 signing
 
-  // Decode recipient StrKey → raw Ed25519 hex
+  // Decode recipient StrKey -> raw Ed25519 hex
   const destRawBytes = StrKey.decodeEd25519PublicKey(RECIPIENT);
   const destEd25519Hex = Buffer.from(destRawBytes).toString("hex");
 
@@ -244,7 +244,7 @@ async function main() {
   try {
     accountData = await server.loadAccount(sourceAddress);
   } catch (e: any) {
-    console.error(`❌  Could not load Stellar account: ${e?.message}`);
+    console.error(`ERROR: Could not load Stellar account: ${e?.message}`);
     console.error(`    Fund ${sourceAddress} on Stellar testnet:`);
     console.error(`    https://friendbot.stellar.org/?addr=${sourceAddress}`);
     process.exit(1);
@@ -263,7 +263,7 @@ async function main() {
   const balanceXlm = parseFloat(xlmBalance);
   const requiredXlm = parseFloat(TRANSFER_AMOUNT_XLM) + 0.01; // transfer + fees + reserve
   if (balanceXlm < requiredXlm) {
-    console.error(`❌  Insufficient XLM balance.`);
+    console.error(`ERROR: Insufficient XLM balance.`);
     console.error(`    Have: ${xlmBalance} XLM`);
     console.error(`    Need: >= ${requiredXlm} XLM`);
     console.error(`    Fund: https://friendbot.stellar.org/?addr=${sourceAddress}`);
@@ -297,9 +297,9 @@ async function main() {
     console.log(`  expires_at:  ${existingPolicy.expires_at ? new Date(existingPolicy.expires_at / 1_000_000).toISOString() : "never"}\n`);
   } else {
     const { selector, mask, condition } = buildNativeXlmPaymentPolicy(destEd25519Hex);
-    console.log(`  mask[0..32]:  0xFF×32  (enforce destination)`);
-    console.log(`  mask[32..36]: 0xFF×4   (enforce native asset type = 0)`);
-    console.log(`  mask[36..88]: 0x00     (allow any amount)`);
+    console.log(`  mask[0..32]:  0xFF x 32  (enforce destination)`);
+    console.log(`  mask[32..36]: 0xFF x 4   (enforce native asset type = 0)`);
+    console.log(`  mask[36..88]: 0x00       (allow any amount)`);
     console.log("  No existing policy — registering...");
     await setPolicy(account, {
       chain: "Stellar",
@@ -318,7 +318,7 @@ async function main() {
   const activePolicy =
     existingPolicy ?? (await getPolicy(account, "Stellar", sourceEd25519Hex, PAYMENT_SELECTOR));
   if (!activePolicy) {
-    console.error("❌  Policy not found after registration — cannot proceed.");
+    console.error("ERROR: Policy not found after registration — cannot proceed.");
     process.exit(1);
   }
   console.log(`  Policy confirmed active for stellar:${sourceEd25519Hex.slice(0, 12)}...:payment`);
@@ -390,21 +390,8 @@ async function main() {
   console.log(`    s     (S): ${sig.s.scalar}`);
   console.log(`    recovery_id: ${sig.recovery_id}\n`);
 
-  // ── Step 8: Build + sign locally with derived Ed25519 keypair ─────
-  console.log("Step 8 — Building signed Stellar transaction...");
-
-  // NOTE: v1.signer-prod.testnet only supports secp256k1 (key_version: 0).
-  // The MPC signature above is a secp256k1 ECDSA signature — it CANNOT be used
-  // as an Ed25519 signature for Stellar. The contract processed the request and
-  // enforced the policy, but the actual Stellar Ed25519 signing must be done
-  // locally using the deterministic Ed25519 keypair derived from the secp256k1
-  // child key (SHA-256 of compressed key → Ed25519 seed).
-  //
-  // Once the MPC signer supports Ed25519 (key_version: 1), this local signing
-  // step should be replaced with the MPC's native Ed25519 signature.
-  console.log("  NOTE: MPC returns secp256k1 sig — signing locally with derived Ed25519 keypair.");
-
-  const stellarKeypair = deriveKeypairFromPublicKey(sourceSecp256k1Hex);
+  // ── Step 8: Build signed Stellar transaction with MPC Ed25519 sig ──
+  console.log("Step 8 — Building signed Stellar transaction with MPC Ed25519 signature...");
 
   // Build the Stellar transaction with the same parameters passed to the contract.
   // TransactionBuilder auto-increments the sequence number once, so we pass
@@ -421,13 +408,13 @@ async function main() {
         amount: TRANSFER_AMOUNT_XLM,
       })
     )
-    // TIMEOUT_INFINITE = 0 → no time bounds → PRECOND_NONE in XDR,
+    // TIMEOUT_INFINITE = 0 -> no time bounds -> PRECOND_NONE in XDR,
     // which matches the contract's build_stellar_payment_payload encoding.
     .setTimeout(TransactionBuilder.TIMEOUT_INFINITE)
     .build();
 
-  // Sign with the locally derived Ed25519 keypair
-  tx.sign(stellarKeypair);
+  // Attach the MPC Ed25519 signature to the transaction envelope
+  attachMpcEd25519Signature(tx, sourceEd25519Hex, sig);
 
   const txHash = Buffer.from(tx.hash()).toString("hex");
   console.log(`  Tx hash:  0x${txHash}`);
@@ -440,7 +427,7 @@ async function main() {
     result = await server.submitTransaction(tx);
   } catch (e: any) {
     const extras = e?.response?.data?.extras;
-    console.error("❌  Stellar transaction submission failed:");
+    console.error("ERROR: Stellar transaction submission failed:");
     console.error(`    Message: ${e?.message}`);
     if (extras?.result_codes) {
       console.error(`    Result codes: ${JSON.stringify(extras.result_codes)}`);
@@ -452,7 +439,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log("\n✅ Transaction confirmed!");
+  console.log("\nTransaction confirmed!");
   console.log(`  Tx hash:  ${result.hash}`);
   console.log(`  Ledger:   ${result.ledger}`);
   console.log(`  Explorer: https://stellar.expert/explorer/testnet/tx/${result.hash}`);
